@@ -93,6 +93,20 @@
         dataType: Argument.dataTypeString,
         requiredOnCreate: false,
         requiredOnEdit: false
+      }),
+      new Argument({
+        name: "batched",
+        description: "Enable to expect input as batches.  default false",
+        dataType: Argument.dataTypeString,
+        requiredOnCreate: false,
+        requiredOnEdit: false
+      }),
+      new Argument({
+        name: "async",
+        description: "Enable async output from custom handler.  default false",
+        dataType: Argument.dataTypeString,
+        requiredOnCreate: false,
+        requiredOnEdit: false
       })
     ];
 
@@ -102,6 +116,8 @@
   exports.streamEvents = function (name, singleInput, eventWriter, done) {
     Logger.info(name, "Starting SQS poller");
     var customHandler = singleInput.handler || '';
+    var batched = Boolean(singleInput.batched) || false;
+    var async = Boolean(singleInput.async) || false;
     var maxNumberOfMessages = Number(singleInput.MaxNumberOfMessages) || 6;
     var visibilityTimeout = Number(singleInput.VisibilityTimeout) || 60;
     var waitTimeSeconds = Number(singleInput.WaitTimeSeconds) || 3;
@@ -141,6 +157,35 @@
             done();
           }
           var batchDelete = {Entries: [], QueueUrl: queueUrl};
+          var curEvent = new Event({
+            source: 'aws:sqs',
+            sourcetype: queueUrl.replace(/^[^/]+\/\/([^/]+\/){2}/g , ''),
+            data: null
+          });
+
+          // Helpers to avoid code redundancy
+          function writeBody(body){
+            if (batched){
+              for (var i = 0, len = body.length; i < len; i++){
+                curEvent.data = body[i];
+                eventWriter.writeEvent(curEvent);  
+              }
+            }
+            else {
+              eventWriter.writeEvent(curEvent);
+            }
+          }
+
+          function onBatchDelete(err, data) {
+            if (err) {
+              Logger.error(name, 'sqs.deleteMessage ' + err);
+            }
+            if (logMore) {
+              Logger.info(name, 'Removing messages from queue');
+            }
+            done();
+          }
+
           // Verifies there are messages
           if(data.hasOwnProperty('Messages')) {
             if (logMore) {
@@ -152,18 +197,40 @@
 
               // run custom handler. optional
               if (customHandler) {
-                body = customHandler.hanlder(body);
+                try {
+                  if (async){
+                    customHandler.handler(body, function(err, body){
+                      if (err){
+                        Logger.error(name, err);
+                      }
+                      else {
+                        writeBody(body);
+                      }
+                      batchDelete.Entries.push({
+                        Id: message.MessageId, 
+                        ReceiptHandle: message.ReceiptHandle
+                      });
+                      // Only execute delete if this is the last message
+                      if (i + 1 === data.Messages.length && batchDelete.Entries){
+                        sqs.deleteMessageBatch(batchDelete, onBatchDelete);
+                      }
+                    });
+                  }
+                  else {
+                    body = customHandler.handler(body);  
+                  }
+                } catch (e) {
+                  Logger.error(name, message.MessageId + ' ' + e.message);
+                }
               }
 
               // Attempt to write event to Splunk
               try {
-                var curEvent = new Event({
-                  source: 'aws:sqs',
-                  sourcetype: queueUrl.replace(/^[^/]+\/\/([^/]+\/){2}/g , ''),
-                  data: body
-                });
-                eventWriter.writeEvent(curEvent);
-                batchDelete.Entries.push({Id: message.MessageId, ReceiptHandle: message.ReceiptHandle})
+                curEvent.data = body;
+                if (!async){
+                  writeBody(body);
+                  batchDelete.Entries.push({Id: message.MessageId, ReceiptHandle: message.ReceiptHandle})
+                }
               }
               catch (e) {
                 Logger.error(name, message.MessageId + ' ' + e.message);
@@ -171,18 +238,13 @@
             }
 
             // Delete received messages from queue
-            if (batchDelete.Entries) {
-              sqs.deleteMessageBatch(batchDelete, function (err, data) {
-                if (err) {
-                  Logger.error(name, 'sqs.deleteMessage ' + err);
-                }
-                if (logMore) {
-                  Logger.info(name, 'Removing messages from queue');
-                }
-              });
+            if (!async && batchDelete.Entries) {
+              sqs.deleteMessageBatch(batchDelete, onBatchDelete);
             }
           }
-          done();
+          else {
+            done();  
+          }   
         });
       },
       function (err) {
